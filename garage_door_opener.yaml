@@ -1,0 +1,407 @@
+substitutions:
+  # Set Home Assistant Entity ID and Friendly Name
+  device_id: garage-door-short-side
+  device_name: Garage Door Short Side
+  # Setup Vehicle Names
+  vehicle1_name: BMW M Performance
+  vehicle2_name: BMW X5
+  vehicle3_name: F150
+  # Setup ultrasonic thresholds used to determine which vehicle is parked
+  vehicle1_min_threshold: '1000'
+  vehicle1_max_threshold: '1200'
+  vehicle2_min_threshold: '800'
+  vehicle2_max_threshold: '1000'
+  vehicle3_min_threshold: '500'
+  vehicle3_max_threshold: '800'
+  # Set ultrasonic sensor distance from garage door opener to floor to detect when there are no vehicles, and also from the opener to the door when fully open
+  door_threshold: '600'
+  floor_threshold: '2000'
+  # Set ultrasonic sensor update interval when door open and when door closed. Recommended a long delay when closed to reduce traffic.
+  ultrasonic_open: '1s'
+  ultrasonic_closed: '300s' 
+
+esphome:
+  name: $device_id
+  friendly_name: $device_name
+  libraries:
+    - Wire
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/MRobi1/M5Stack-ESPHome/
+      ref: main
+    components: m5stack_pbhub
+  - source:
+      type: git
+      url: https://github.com/MRobi1/M5Stack-ESPHome/
+      ref: main
+    components: sonic_i2c    
+
+esp32:
+  board: m5stack-atom
+  framework:
+    type: arduino
+
+# Enable logging
+logger: 
+  level: DEBUG
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "fN+Z4MwzGQ3HXaqXLR+4NhNw1YlEGZyR3ARLMVXPK2c="
+
+ota:
+  password: "9a0138615774538f0dd18f69617ee166"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: "192.168.3.9"
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: $device_id
+    password: !secret wifi_password
+
+captive_portal:
+
+bluetooth_proxy:
+  active: true
+
+i2c:
+  sda: 26
+  scl: 32
+  scan: true
+  id: bus_a
+
+#Pin numberring in the PbHUB (The first digit is the channel number and the second digit is the pin number)
+# CHANNEL 0 : 00 and 01
+# CHANNEL 1 : 10 and 11
+# CHANNEL 2 : 20 and 21
+# CHANNEL 3 : 30 and 31
+# CHANNEL 4 : 40 and 41
+# CHANNEL 5 : 50 and 51
+m5stack_pbhub:
+  - id: 'M5Stack_HUB'
+    address: 0x61
+    sda: 26 # I2C SDA Pin (Yellow grove cable)
+    scl: 32 # I2C SCL Pin (White grove cable)
+
+tca9548a:
+  - address: 0x70
+    id: multiplex0
+    i2c_id: bus_a
+    channels:
+      - bus_id: multiplex0channel0
+        channel: 0
+      - bus_id: multiplex0channel1
+        channel: 1
+
+binary_sensor:
+  - platform: template
+    name: Is Jammed
+    id: is_jammed
+    device_class: problem
+  - platform: template
+    name: Is Open
+    id: is_open
+    device_class: garage_door
+  - platform: gpio
+    pin:
+      number: 39
+      inverted: true
+    name: Side Button
+    internal: true
+    on_press:
+      - button.press: beeper
+      - delay: 3s
+      - switch.turn_on: door_relay
+  - platform: gpio
+    pin:
+      m5stack_pbhub: M5Stack_HUB
+      number: 11
+      mode:
+        output: true
+      inverted: false
+    name: Motion Sensor
+    id: pir_sensor
+    device_class: motion
+  - platform: gpio
+    pin:
+      m5stack_pbhub: M5Stack_HUB
+      number: 21 # connect to grove cable white wire and ground wire through Pb.Hub
+      mode:
+        input: true
+    name: Closed Contact Sensor
+    id: closed_contact_sensor
+    device_class: garage_door
+    filters:
+      # Debounce the contact sensor to prevent rapid on/off/on events
+      - delayed_on: 10ms
+      - delayed_off: 1s
+    on_release:
+       - cover.template.publish:
+           id: garage_door
+           state: CLOSED
+           current_operation: IDLE
+       - binary_sensor.template.publish:
+          id: is_jammed
+          state: OFF
+       - binary_sensor.template.publish:
+          id: is_open
+          state: OFF
+    on_press: 
+       - cover.template.publish:
+           id: garage_door
+           current_operation: OPENING    
+       - binary_sensor.template.publish:
+          id: is_open
+          state: ON
+       - delay: 25s
+       - if:
+           condition:
+             - and:
+               - binary_sensor.is_off: open_contact_sensor
+               - binary_sensor.is_off: ultrasonic_door_sensor
+           then: 
+              - binary_sensor.template.publish:
+                  id: is_jammed
+                  state: ON            
+  - platform: gpio
+    pin:
+      m5stack_pbhub: M5Stack_HUB
+      number: 31 # Connect to grove cable white wire and ground wire on Pb.Hub
+      mode:
+        input: true
+    name: Open Contact Sensor
+    id: open_contact_sensor
+    device_class: garage_door
+    filters:
+      # Debounce the contact sensor to prevent rapid on/off/on events
+      - delayed_on: 3s
+      - delayed_off: 3s
+      - invert:
+    on_press:
+       - cover.template.publish:
+           id: garage_door
+           state: OPEN
+           current_operation: IDLE
+       - binary_sensor.template.publish:
+          id: is_jammed
+          state: OFF
+    on_release: 
+       - cover.template.publish:
+           id: garage_door
+           current_operation: CLOSING  
+       - delay: 25s
+       - if:
+           condition:
+             binary_sensor.is_on: closed_contact_sensor
+           then: 
+              - binary_sensor.template.publish:
+                  id: is_jammed
+                  state: ON
+  - platform: template
+    name: Vehicle Parked
+    id: ultrasonic_vehicle
+    lambda: |-
+      if (id(ultrasonicvehicle).state < $floor_threshold) {
+        // vehicle is in the garage
+        return true;
+      } else {
+        // no vehicle
+        return false;
+      }
+  - platform: template  
+    name: Ultrasonic Door State
+    id: ultrasonic_door_sensor
+    device_class: garage_door
+    lambda: |-
+      if (id(ultrasonicdoor).state <= $door_threshold && id(ultrasonicdoor).state > 0) {
+        // door is open
+        return true;
+      } else {
+        // door closed
+        return false;
+      }
+    on_press:
+       - cover.template.publish:
+           id: garage_door
+           state: OPEN
+           current_operation: IDLE
+       - binary_sensor.template.publish:
+          id: is_jammed
+          state: OFF
+    on_release: 
+       - cover.template.publish:
+           id: garage_door
+           current_operation: CLOSING  
+       - delay: 25s
+       - if:
+           condition:
+             binary_sensor.is_on: closed_contact_sensor
+           then: 
+              - binary_sensor.template.publish:
+                  id: is_jammed
+                  state: ON
+    
+switch:
+  - platform: restart
+    name: Restart
+    id: restart_garage
+  - platform: gpio
+    pin:
+      m5stack_pbhub: M5Stack_HUB
+      number: 40 #grove cable yellow wire and ground wire
+      mode:
+        output: true
+      inverted: false
+    id: beep
+    internal: true
+  - platform: gpio
+    pin:
+      m5stack_pbhub: M5Stack_HUB
+      number: 00
+      mode:
+        output: true
+      inverted: false
+    name: Override Switch
+    id: door_relay
+    restore_mode: ALWAYS_OFF
+    internal: false
+    on_turn_on:
+    - delay: 250ms
+    - switch.turn_off: door_relay
+  
+sensor:
+  - platform: wifi_signal
+    name: WiFi Signal
+    update_interval: 60s
+  - platform: uptime
+    name: Uptime
+    filters:
+      - lambda: return x / 86400.0;
+    unit_of_measurement: "days"
+    accuracy_decimals: 1
+  - platform: sonic_i2c
+    i2c_id: multiplex0channel1
+    address: 0x57
+    name: $device_name Door Distance
+    internal: true
+    id: ultrasonicdoor
+    unit_of_measurement: mm
+    update_interval: $ultrasonic_closed
+  - platform: template
+    name: Door Sensor Distance
+    id: door_distance_template
+    lambda: 'return id(ultrasonicdoor).state;'
+    unit_of_measurement: mm
+    update_interval: $ultrasonic_closed
+  - platform: sonic_i2c
+    i2c_id: multiplex0channel0
+    address: 0x57
+    name: $device_name Vehicle Distance
+    internal: true
+    id: ultrasonicvehicle
+    unit_of_measurement: mm
+    update_interval: $ultrasonic_closed
+  - platform: template
+    name: Vehicle Distance Sensor
+    id: vehicle_distance_template
+    lambda: 'return id(ultrasonicvehicle).state;'
+    unit_of_measurement: mm
+    update_interval: $ultrasonic_closed
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP Address
+  - platform: template
+    id: which_vehicle
+    name: "Which Vehicle Parked"
+    lambda: |-
+      if (id(ultrasonicvehicle).state > $vehicle1_min_threshold && id(ultrasonicvehicle).state <= $vehicle1_max_threshold) {
+        // Vehicle 1
+        return {"$vehicle1_name"};
+      } if (id(ultrasonicvehicle).state > $vehicle2_min_threshold && id(ultrasonicvehicle).state <= $vehicle2_max_threshold) {
+        // Vehicle 2
+        return {"$vehicle2_name"};
+      } if (id(ultrasonicvehicle).state > $vehicle3_min_threshold && id(ultrasonicvehicle).state <= $vehicle3_max_threshold) {
+        // Vehicle 3
+        return {"$vehicle3_name"};
+      } else {
+        // No Vehicle
+        return {"None"};
+      }
+    update_interval: $ultrasonic_closed
+
+interval:
+  - interval: $ultrasonic_open
+    then:
+      - if:
+          condition:
+            - lambda: 'return id(is_open).state;'
+          then:
+            - component.update: ultrasonicvehicle
+            - component.update: ultrasonicdoor
+            - component.update: vehicle_distance_template
+            - component.update: door_distance_template
+            - component.update: which_vehicle
+
+button:
+  - platform: template
+    name: $device_name Beep
+    id: beeper
+    internal: true
+    on_press:
+    - repeat:
+        count: 12
+        then:
+            - switch.turn_on: beep
+            - light.turn_on: 
+                id: status_led
+                transition_length: 0s
+            - delay: 120ms
+            - switch.turn_off: beep
+            - light.turn_off:
+                id: status_led
+                transition_length: 0s
+            - delay: 120ms
+
+light:
+  - platform: neopixelbus
+    internal: true
+    type: GRB
+    variant: SK6812
+    pin: 27
+    num_leds: 1
+    id: status_led
+    name: $device_name Light
+    effects:
+      - flicker:
+      - strobe:
+
+cover:
+  - platform: template
+    name: $device_name
+    device_class: garage
+    id: garage_door
+    open_action:
+      - button.press: beeper
+      - delay: 3s
+      - switch.turn_on: door_relay
+    close_action:
+      - button.press: beeper
+      - delay: 3s      
+      - switch.turn_on: door_relay
+    stop_action:
+      - if:
+           condition:
+             - and:
+               - binary_sensor.is_on: closed_contact_sensor
+               - binary_sensor.is_off: open_contact_sensor
+               - binary_sensor.is_off: ultrasonic_door_sensor
+           then: 
+             - switch.turn_on: door_relay
